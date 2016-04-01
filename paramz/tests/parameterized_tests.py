@@ -10,11 +10,12 @@ from ..core.observable_array import ObsAr
 from ..core.index_operations import ParameterIndexOperations
 from ..core.nameable import adjust_name_for_printing
 from ..core import HierarchyError
-from paramz import transformations
+from .. import transformations
 from ..parameterized import Parameterized
-from ..param import Param
+from ..param import Param, ParamConcatenation
 from ..model import Model
-from paramz.param import ParamConcatenation
+from unittest.case import SkipTest
+from paramz.caching import Cache_this
 
 class ArrayCoreTest(unittest.TestCase):
     def setUp(self):
@@ -35,9 +36,10 @@ def test_constraints_in_init():
     class Test(Parameterized):
         def __init__(self, name=None, parameters=[], *a, **kw):
             super(Test, self).__init__(name=name)
-            self.x = Param('x', np.random.uniform(0,1,(3,4)))
+            self.x = Param('x', np.random.uniform(0,1,(3,4)), transformations.__fixed__)
             self.x[0].constrain_bounded(0,1)
             self.link_parameter(self.x)
+            self.x.unfix()
             self.x[1].fix()
     t = Test()
     c = {transformations.Logistic(0,1): np.array([0, 1, 2, 3]), 'fixed': np.array([4, 5, 6, 7])}
@@ -46,7 +48,8 @@ def test_constraints_in_init():
 
 def test_parameter_modify_in_init():
     class TestLikelihood(Parameterized):
-        def __init__(self, param1 = 2., param2 = 3.):
+        def __init__(self, param1 = 2., param2 = 3., param3 = np.random.uniform(size=(2,2,2))):
+
             super(TestLikelihood, self).__init__("TestLike")
             self.p1 = Param('param1', param1)
             self.p2 = Param('param2', param2)
@@ -56,11 +59,17 @@ def test_parameter_modify_in_init():
 
             self.p1.fix()
             self.p1.unfix()
+
+            self['.*param'].constrain_positive()
+
             self.p2.constrain_negative()
             self.p1.fix()
             self.p2.constrain_positive()
             self.p2.fix()
             self.p2.constrain_positive()
+
+            self['.*param1'].unconstrain(transformations.Logexp())
+
 
     m = TestLikelihood()
     print(m)
@@ -69,13 +78,18 @@ def test_parameter_modify_in_init():
     assert(m.constraints[transformations.Logexp()].tolist() == [1])
     m.randomize()
     assert(m.p1 == val)
-    
+
 class P(Parameterized):
     def __init__(self, name, **kwargs):
         super(P, self).__init__(name=name)
         for k, val in kwargs.items():
             self.__setattr__(k, val)
             self.link_parameter(self.__getattribute__(k))
+
+    @Cache_this()
+    def heres_johnny(self, ignore=1):
+        return 0
+
 
 class ModelTest(unittest.TestCase):
 
@@ -92,10 +106,13 @@ class ModelTest(unittest.TestCase):
                 return -self.objective_function()
             def parameters_changed(self):
                 self._obj = (self.param_array**2).sum()
+                for p in self.parameters:
+                    if hasattr(p, 'heres_johnny'):
+                        p.heres_johnny()
                 self.gradient[:] = 2*self.param_array
-        
+
         self.testmodel = M('testmodel')
-        self.testmodel.kern = Parameterized('rbf')
+        self.testmodel.kern = P('rbf')
         self.testmodel.likelihood = P('Gaussian_noise', variance=Param('variance', np.random.uniform(0.1, 0.5), transformations.Logexp()))
         self.testmodel.link_parameter(self.testmodel.kern)
         self.testmodel.link_parameter(self.testmodel.likelihood)
@@ -112,6 +129,44 @@ class ModelTest(unittest.TestCase):
         # rbf.lengthscale          |    1.0  |     +ve      |         |
         # Gaussian_noise.variance  |    1.0  |     +ve      |         |
         #=============================================================================
+    def test_pydot(self):
+        try:
+            import pydot
+            G = self.testmodel.build_pydot()
+            testmodel_node_labels = set(['testmodel',
+ 'lengthscale',
+ 'variance',
+ 'Cacher(heres_johnny)\n  limit=5\n  \\#cached=1',
+ 'rbf',
+ 'Cacher(heres_johnny)\n  limit=5\n  \\#cached=1',
+ 'Gaussian_noise',
+ 'variance'])
+            testmodel_edges = set([tuple(e) for e in [['variance', 'Gaussian_noise'],
+ ['Gaussian_noise', 'Cacher(heres_johnny)\n  limit=5\n  \\#cached=1'],
+ ['rbf', 'rbf'],
+ ['Gaussian_noise', 'variance'],
+ ['testmodel', 'Gaussian_noise'],
+ ['lengthscale', 'rbf'],
+ ['rbf', 'lengthscale'],
+ ['rbf', 'testmodel'],
+ ['variance', 'rbf'],
+ ['testmodel', 'rbf'],
+ ['testmodel', 'testmodel'],
+ ['Gaussian_noise', 'testmodel'],
+ ['Gaussian_noise', 'Gaussian_noise'],
+ ['rbf', 'variance'],
+ ['rbf', 'Cacher(heres_johnny)\n  limit=5\n  \\#cached=1']]])
+
+            self.assertSetEqual(set([n.get_label() for n in G.get_nodes()]), testmodel_node_labels)
+
+            edges = set()
+            for e in G.get_edges():
+                points = e.obj_dict['points']
+                edges.add(tuple(G.get_node(p)[0].get_label() for p in points))
+
+            self.assertSetEqual(edges, testmodel_edges)
+        except ImportError:
+            raise SkipTest("pydot not available")
 
     def test_optimize_preferred(self):
         self.testmodel.update_toggle()
@@ -135,7 +190,28 @@ class ModelTest(unittest.TestCase):
             self.testmodel.optimize_restarts(1, messages=1, optimizer=opt_tnc(), verbose=False)
             self.testmodel.optimize('tnc', messages=1, xtol=0, ftol=0, gtol=1e-6)
         np.testing.assert_array_less(self.testmodel.gradient, np.ones(self.testmodel.size)*1e-2)
-        self.assertListEqual(self.testmodel.optimization_runs[-1].__getstate__(), [])
+        self.assertDictEqual(self.testmodel.optimization_runs[-1].__getstate__(), {})
+    def test_optimize_rprop(self):
+        try:
+            import climin
+        except ImportError:
+            raise SkipTest("climin not installed, skipping test")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.testmodel.optimize('rprop', messages=1)
+        np.testing.assert_array_less(self.testmodel.gradient, np.ones(self.testmodel.size)*1e-2)
+    def test_optimize_ada(self):
+        try:
+            import climin
+        except ImportError:
+            raise SkipTest("climin not installed, skipping test")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.testmodel.trigger_update()
+            self.testmodel.optimize('adadelta', messages=1, step_rate=1, momentum=1)
+        np.testing.assert_array_less(self.testmodel.gradient, np.ones(self.testmodel.size)*1e-2)
     def test_optimize_org_bfgs(self):
         import warnings
         with warnings.catch_warnings():
@@ -176,42 +252,57 @@ class ModelTest(unittest.TestCase):
         testmodel = M("test", var=Param('test', np.random.normal(0,1,(20))))
         testmodel.optimize_restarts(2, messages=0, optimizer='org-bfgs', xtol=0, ftol=0, gtol=1e-6, robust=True)
         self.assertRaises(ValueError, testmodel.optimize_restarts, 1, messages=0, optimizer='org-bfgs', xtol=0, ftol=0, gtol=1e-6, robust=False)
-        
-        
+
     def test_raveled_index(self):
         self.assertListEqual(self.testmodel._raveled_index_for(self.testmodel['.*variance']).tolist(), [1, 2])
+        self.assertListEqual(self.testmodel.kern.lengthscale._raveled_index_for(None).tolist(), [0])
 
     def test_constraints_testmodel(self):
-        self.testmodel.rbf.constrain_negative()
+        self.testmodel['.*rbf'].constrain_negative()
         self.assertListEqual(self.testmodel.constraints[transformations.NegativeLogexp()].tolist(), [0,1])
 
-        self.testmodel.rbf.lengthscale.constrain_bounded(0,1)
+        self.testmodel['.*lengthscale'].constrain_bounded(0,1)
         self.assertListEqual(self.testmodel.constraints[transformations.NegativeLogexp()].tolist(), [1])
         self.assertListEqual(self.testmodel.constraints[transformations.Logistic(0, 1)].tolist(), [0])
 
-        self.testmodel.unconstrain_negative()
+        self.testmodel[''].unconstrain_negative()
         self.assertListEqual(self.testmodel.constraints[transformations.NegativeLogexp()].tolist(), [])
         self.assertListEqual(self.testmodel.constraints[transformations.Logistic(0, 1)].tolist(), [0])
 
-        self.testmodel.rbf.lengthscale.unconstrain_bounded(0,1)
+        self.testmodel['.*lengthscale'].unconstrain_bounded(0,1)
         self.assertListEqual(self.testmodel.constraints[transformations.Logistic(0, 1)].tolist(), [])
 
     def test_updates(self):
         val = float(self.testmodel.objective_function())
         self.testmodel.toggle_update()
-        self.testmodel.kern.randomize()
+        self.testmodel.kern.randomize(np.random.normal, loc=1, scale=.2)
         self.testmodel.likelihood.randomize()
         self.assertEqual(val, self.testmodel.objective_function())
         self.testmodel.update_model(True)
         self.assertNotEqual(val, self.testmodel.objective_function())
+
+    def test_set_gradients(self):
+        self.testmodel.gradient = 10.
+        np.testing.assert_array_equal(self.testmodel.gradient, 10.)
+        self.testmodel.kern.lengthscale.gradient = 15
+        np.testing.assert_array_equal(self.testmodel.gradient, [15., 10., 10.])
 
     def test_fixing_optimize(self):
         self.testmodel.kern.lengthscale.fix()
         val = float(self.testmodel.kern.lengthscale)
         self.testmodel.randomize()
         self.assertEqual(val, self.testmodel.kern.lengthscale)
+        self.testmodel.optimize(max_iters=2)
 
     def test_regular_expression_misc(self):
+        self.assertTrue(self.testmodel[''].checkgrad())
+
+        self.testmodel['.*rbf'][:] = 10
+        self.testmodel[''][2] = 11
+
+        np.testing.assert_array_equal(self.testmodel.param_array, [10,10,11])
+        np.testing.assert_((self.testmodel[''][:2] == [10,10]).all())
+
         self.testmodel.kern.lengthscale.fix()
         val = float(self.testmodel.kern.lengthscale)
         self.testmodel.randomize()
@@ -222,26 +313,120 @@ class ModelTest(unittest.TestCase):
         self.testmodel.randomize()
         np.testing.assert_equal(variances, self.testmodel['.*var'].values())
 
+        self.testmodel[''] = 1.0
+        self.maxDiff = None
+
+        self.testmodel[''].unconstrain()
+        self.assertSequenceEqual(self.testmodel[''].__str__(VT100=False), "  index  |          testmodel.rbf.lengthscale  |  constraints\n  [0]    |                         1.00000000  |             \n  -----  |             testmodel.rbf.variance  |  -----------\n  [0]    |                         1.00000000  |             \n  -----  |  testmodel.Gaussian_noise.variance  |  -----------\n  [0]    |                         1.00000000  |             ")
+
     def test_fix_unfix(self):
-        fixed = self.testmodel.kern.lengthscale.fix()
+        default_constraints = dict(self.testmodel.constraints.items())
+        self.testmodel['.*lengthscale'].fix()
+        fixed = self.testmodel.constraints[transformations.__fixed__]
         self.assertListEqual(fixed.tolist(), [0])
         unfixed = self.testmodel.kern.lengthscale.unfix()
-        self.testmodel.kern.lengthscale.constrain_positive()
+        self.testmodel['.*lengthscale'].constrain_positive()
         self.assertListEqual(unfixed.tolist(), [0])
 
-        fixed = self.testmodel.kern.fix()
+        fixed = self.testmodel['.*rbf'].fix()
+        fixed = self.testmodel.constraints[transformations.__fixed__]
         self.assertListEqual(fixed.tolist(), [0,1])
+
         unfixed = self.testmodel.kern.unfix()
         self.assertListEqual(unfixed.tolist(), [0,1])
+
+        fixed = self.testmodel.constraints[transformations.__fixed__]
+        self.testmodel['.*rbf'].unfix()
+        np.testing.assert_array_equal(fixed, self.testmodel.constraints[transformations.__fixed__])
+
+        #print default_constraints
+        test_constraints = dict(self.testmodel.constraints.items())
+        for k in default_constraints:
+            np.testing.assert_array_equal(default_constraints[k], test_constraints[k])
+
+    def test_fix_unfix_constraints(self):
+        self.testmodel.constrain_bounded(0,1)
+        self.testmodel['.*variance'].constrain(transformations.Logexp())
+        self.testmodel['.*Gauss'].constrain_bounded(0.3, 0.7)
+        before_constraints = dict(self.testmodel.constraints.items())
+
+        self.testmodel.fix()
+
+        test_constraints = dict(self.testmodel.constraints.items())
+        for k in before_constraints:
+            np.testing.assert_array_equal(before_constraints[k], test_constraints[k])
+        np.testing.assert_array_equal(test_constraints[transformations.__fixed__], [0,1,2])
+
+
+        # Assert fixing works and does not randomize the - say - lengthscale:
+        val = float(self.testmodel.kern.lengthscale)
+        self.testmodel.randomize()
+        self.assertEqual(val, self.testmodel.kern.lengthscale)
+
+        self.testmodel.unfix()
+
+        test_constraints = dict(self.testmodel.constraints.items())
+        for k in before_constraints:
+            np.testing.assert_array_equal(before_constraints[k], test_constraints[k])
+
+    def test_fix_constrain(self):
+        # save the constraints as they where:
+        before_constraints = dict(self.testmodel.constraints.items())
+        # fix
+        self.testmodel.fix()
+
+        test_constraints = dict(self.testmodel.constraints.items())
+        # make sure fixes are in place:
+        np.testing.assert_array_equal(test_constraints[transformations.__fixed__], [0,1,2])
+        # make sure, the constraints still exist
+        for k in before_constraints:
+            np.testing.assert_array_equal(before_constraints[k], test_constraints[k])
+
+        # override fix and previous constraint:
+        self.testmodel.likelihood.constrain_bounded(0,1)
+        # lik not fixed anymore
+        np.testing.assert_array_equal(self.testmodel.constraints[transformations.__fixed__], [0,1])
+        # previous constraints still in place:
+        np.testing.assert_array_equal(self.testmodel.constraints[transformations.Logexp()], [0,1])
+        # lik bounded
+        np.testing.assert_array_equal(self.testmodel.constraints[transformations.Logistic(0,1)], [2])
+
+    def test_caching_offswitch(self):
+        self.assertEqual(len(self.testmodel.kern.cache), 1)
+        [self.assertEqual(len(c.cached_outputs), 1) for c in self.testmodel.kern.cache.values()]
+
+        self.testmodel.disable_caching()
+        self.testmodel.trigger_update()
+
+        [self.assertFalse(c.cacher_enabled) for c in self.testmodel.kern.cache.values()]
+        self.assertFalse(self.testmodel.kern.cache.caching_enabled)
+        self.assertFalse(self.testmodel.likelihood.cache.caching_enabled)
+
+        self.assertTrue(self.testmodel.checkgrad())
+
+        self.assertEqual(len(self.testmodel.kern.cache), 1)
+
+        [self.assertEqual(len(c.cached_outputs), 0) for c in self.testmodel.kern.cache.values()]
+
+        self.testmodel.enable_caching()
+        self.testmodel.trigger_update()
+
+        self.assertEqual(len(self.testmodel.kern.cache), 1)
+        [self.assertEqual(len(c.cached_outputs), 1) for c in self.testmodel.kern.cache.values()]
+
 
     def test_checkgrad(self):
         self.assertTrue(self.testmodel.checkgrad(1))
         self.assertTrue(self.testmodel.checkgrad())
         self.assertTrue(self.testmodel.rbf.variance.checkgrad(1))
         self.assertTrue(self.testmodel.rbf.variance.checkgrad())
+        self.assertTrue(self.testmodel._checkgrad(verbose=1))
+        self.assertTrue(self.testmodel._checkgrad(verbose=0))
 
     def test_printing(self):
         print(self.testmodel.hierarchy_name(False))
+        self.assertEqual(self.testmodel.num_params, 2)
+        self.assertEqual(self.testmodel.kern.lengthscale.num_params, 0)
 
     def test_hierarchy_error(self):
         self.assertRaises(HierarchyError, self.testmodel.link_parameter, self.testmodel.parameters[0])
@@ -263,7 +448,7 @@ class ModelTest(unittest.TestCase):
 
     def test_likelihood_replicate(self):
         m = self.testmodel
-        m2 = self.testmodel.copy()
+        m2 = self.testmodel.copy(memo={})
 
         np.testing.assert_array_equal(self.testmodel[:], m2[:])
 
@@ -304,7 +489,7 @@ class ModelTest(unittest.TestCase):
         pars = self.testmodel[:].copy()
         self.testmodel.rbf[:] = None
         np.testing.assert_array_equal(self.testmodel[:], pars)
-    
+
     def test_set_error(self):
         self.assertRaises(ValueError, self.testmodel.__setitem__, slice(None), 'test')
 
@@ -323,7 +508,7 @@ class ModelTest(unittest.TestCase):
         self.assertIsInstance(self.testmodel['.*rbf$'], Parameterized)
         self.assertIs(self.testmodel['rbf.variance'], self.testmodel.rbf.variance)
         self.assertIs(self.testmodel['rbf$'], self.testmodel.rbf)
-            
+
     def test_likelihood_set(self):
         m = self.testmodel
         m2 = self.testmodel.copy()
@@ -344,7 +529,7 @@ class ModelTest(unittest.TestCase):
         m.kern.lengthscale.randomize()
         m2.kern.lengthscale = m.kern['.*lengthscale']
         np.testing.assert_equal(m.log_likelihood(), m2.log_likelihood())
-        
+
         np.testing.assert_array_equal(self.testmodel[''].values(), m2[''].values())
         np.testing.assert_array_equal(self.testmodel[:], m2[''].values())
         np.testing.assert_array_equal(self.testmodel[''].values(), m2[:])
@@ -359,16 +544,16 @@ class ModelTest(unittest.TestCase):
 #        p = Param('test', np.random.normal(0,1,2))
 #        m = Parameterized('test')
 #        self.assertRaises(ValueError, m.link_parameter, p[:,None])
-        
+
 
 class ParameterizedTest(unittest.TestCase):
 
     def setUp(self):
         self.rbf = Parameterized('rbf')
         self.rbf.lengthscale = Param('lengthscale', np.random.uniform(.1, 1), transformations.Logexp())
-        self.rbf.variance = Param('variance', np.random.uniform(0.1, 0.5), transformations.Logexp()) 
+        self.rbf.variance = Param('variance', np.random.uniform(0.1, 0.5), transformations.Logexp())
         self.rbf.link_parameters(self.rbf.variance, self.rbf.lengthscale)
-        
+
         self.white = P('white', variance=Param('variance', np.random.uniform(0.1, 0.5), transformations.Logexp()))
         self.param = Param('param', np.random.uniform(0,1,(10,5)), transformations.Logistic(0, 1))
 
@@ -377,7 +562,7 @@ class ParameterizedTest(unittest.TestCase):
         self.test1.param = self.param
         self.test1.kern = Parameterized('add')
         self.test1.kern.link_parameters(self.rbf, self.white)
-        
+
         self.test1.link_parameter(self.test1.kern)
         self.test1.link_parameter(self.param, 0)
 
@@ -389,7 +574,10 @@ class ParameterizedTest(unittest.TestCase):
         # add.rbf.lengthscale  |        1.0  |  0.0,1.0 +ve  |         |
         # add.white.variance   |        1.0  |  0.0,1.0 +ve  |         |
         #=============================================================================
-        
+
+    def test_original(self):
+        self.assertIs(self.test1.param[[0]]._get_original(None), self.param)
+
     def test_unfixed_param_array(self):
         self.test1.param_array[:] = 0.1
         np.testing.assert_array_equal(self.test1.unfixed_param_array, [0.1]*53)
@@ -397,16 +585,17 @@ class ParameterizedTest(unittest.TestCase):
         self.test1.kern.rbf.lengthscale.fix()
         np.testing.assert_array_equal(self.test1.kern.unfixed_param_array, [0.1, 0.1])
         np.testing.assert_array_equal(self.test1.unfixed_param_array, [0.1]*52)
-        
+
     def test_set_param_array(self):
         self.assertRaises(AttributeError, setattr, self.test1, 'param_array', 0)
-    
+
     def test_fixed_optimizer_copy(self):
         self.test1[:] = 0.1
         self.test1.unconstrain()
         np.testing.assert_array_equal(self.test1.kern.white.optimizer_array, [0.1])
-        self.test1.kern.constrain(transformations.__fixed__)
-        
+        self.test1.kern.fix()
+        #self.assertRaises(ValueError, self.test1.kern.constrain, transformations.__fixed__)
+
         np.testing.assert_array_equal(self.test1.optimizer_array, [0.1]*50)
         np.testing.assert_array_equal(self.test1.optimizer_array, self.test1.param.optimizer_array)
 
@@ -419,23 +608,25 @@ class ParameterizedTest(unittest.TestCase):
         np.testing.assert_array_equal(self.test1.kern.white.optimizer_array, [])
 
     def test_param_names(self):
-        self.assertSequenceEqual(self.test1.kern.rbf._get_param_names_transformed().tolist(), ['test_parameterized.add.rbf.variance[[0]]', 'test_parameterized.add.rbf.lengthscale[[0]]'])
+        self.assertSequenceEqual(self.test1.kern.rbf.parameter_names_flat().tolist(), ['test_parameterized.add.rbf.variance', 'test_parameterized.add.rbf.lengthscale'])
 
         self.test1.param.fix()
         self.test1.kern.rbf.lengthscale.fix()
-        self.assertSequenceEqual(self.test1._get_param_names_transformed().tolist(), ['test_parameterized.add.rbf.variance[[0]]', 'test_parameterized.add.white.variance[[0]]'])
-        
+        self.assertSequenceEqual(self.test1.parameter_names_flat().tolist(), ['test_parameterized.add.rbf.variance', 'test_parameterized.add.white.variance'])
+        self.assertEqual(self.test1.parameter_names_flat(include_fixed=True).size, self.test1.size)
+
     def test_num_params(self):
         self.assertEqual(self.test1.num_params, 2)
         self.assertEqual(self.test1.add.num_params, 2)
         self.assertEqual(self.test1.add.white.num_params, 1)
         self.assertEqual(self.test1.add.rbf.num_params, 2)
-        
+
     def test_index_operations(self):
         self.assertRaises(AttributeError, self.test1.add_index_operation, 'constraints', None)
         self.assertRaises(AttributeError, self.test1.remove_index_operation, 'not_an_index_operation')
-        
+
     def test_names(self):
+        self.assertSequenceEqual(self.test1.parameter_names(adjust_for_printing=True), self.test1.parameter_names(adjust_for_printing=False))
         self.test1.unlink_parameter(self.test1.kern)
         newname = 'this@is a+new name!'
         self.test1.kern.name = newname
@@ -444,7 +635,7 @@ class ParameterizedTest(unittest.TestCase):
         self.assertSequenceEqual(self.test1.kern.hierarchy_name(False), 'test_parameterized.'+newname)
         self.assertSequenceEqual(self.test1.kern.hierarchy_name(True), 'test_parameterized.'+adjust_name_for_printing(newname))
         self.assertRaises(NameError, adjust_name_for_printing, '%')
-        
+
     def test_traverse_parents(self):
         c = []
         self.test1.kern.rbf.traverse_parents(lambda x: c.append(x.name))
@@ -452,7 +643,7 @@ class ParameterizedTest(unittest.TestCase):
         c = []
         self.test1.kern.white.variance.traverse_parents(lambda x: c.append(x.name))
         self.assertSequenceEqual(c, ['test_parameterized', 'param', 'add', 'rbf', 'variance', 'lengthscale', 'white'])
-        
+
     def test_names_already_exist(self):
         self.test1.kern.name = 'newname'
         self.test1.p = Param('newname', 1.22345)
@@ -469,7 +660,7 @@ class ParameterizedTest(unittest.TestCase):
         self.test1.kern.rbf.variance.name = 'variance'
         self.assertSequenceEqual(self.test1.kern.rbf.lengthscale.name, 'variance_2')
         self.assertSequenceEqual(self.test1.kern.rbf.variance.name, 'variance')
-        
+
 
     def test_add_parameter(self):
         self.assertEquals(self.rbf._parent_index_, 0)
@@ -586,6 +777,57 @@ class ParameterizedTest(unittest.TestCase):
         print(self.test1)
         print(self.param)
         print(self.test1[''])
+
+class InitTests(unittest.TestCase):
+    def setUp(self):
+        class M(Model):
+            def __init__(self, name, **kwargs):
+                super(M, self).__init__(name=name)
+                for k, val in kwargs.items():
+                    self.__setattr__(k, val)
+                    self.link_parameter(self.__getattribute__(k))
+            def objective_function(self):
+                return self._obj
+            def log_likelihood(self):
+                return -self.objective_function()
+            def parameters_changed(self):
+                self._obj = (self.param_array**2).sum()
+                self.gradient[:] = 2*self.param_array
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.testmodel = M('testmodel', initialize=False)
+            self.testmodel.kern = Parameterized('rbf', initialize=False)
+            self.testmodel.likelihood = P('Gaussian_noise', variance=Param('variance', np.random.uniform(0.1, 0.5), transformations.Logexp()), initialize=False)
+        self.testmodel.link_parameter(self.testmodel.kern)
+        self.testmodel.link_parameter(self.testmodel.likelihood)
+        variance=Param('variance', np.random.uniform(0.1, 0.5), transformations.Logexp())
+        lengthscale=Param('lengthscale', np.random.uniform(.1, 1, 1), transformations.Logexp())
+        self.testmodel.kern.variance = variance
+        self.testmodel.kern.lengthscale = lengthscale
+        self.testmodel.kern.link_parameter(lengthscale)
+        self.testmodel.kern.link_parameter(variance)
+
+    def test_initialize(self):
+        self.assertFalse(self.testmodel.likelihood._model_initialized_)
+        self.assertFalse(self.testmodel.kern._model_initialized_)
+        self.assertRaises(AttributeError, self.testmodel.__str__)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            # check the warning is being raised
+            self.assertRaises(RuntimeWarning, self.testmodel.checkgrad)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # check that the gradient checker just returns false
+            self.assertFalse(self.testmodel.checkgrad())
+            self.assertFalse(self.testmodel.kern.checkgrad())
+        self.testmodel.initialize_parameter()
+        self.assertTrue(self.testmodel.likelihood._model_initialized_)
+        self.assertTrue(self.testmodel.kern._model_initialized_)
+        self.assertTrue(self.testmodel.checkgrad())
+
+
 
 if __name__ == "__main__":
     #import sys;sys.argv = ['', 'Test.test_add_parameter']

@@ -8,21 +8,21 @@ Observable Pattern for patameterization
 #===============================================================================
 # Copyright (c) 2015, Max Zwiessele
 # All rights reserved.
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
-# 
+#
 # * Redistributions of source code must retain the above copyright notice, this
 #   list of conditions and the following disclaimer.
-# 
+#
 # * Redistributions in binary form must reproduce the above copyright notice,
 #   this list of conditions and the following disclaimer in the documentation
 #   and/or other materials provided with the distribution.
-# 
+#
 # * Neither the name of paramax nor the names of its
 #   contributors may be used to endorse or promote products derived from
 #   this software without specific prior written permission.
-# 
+#
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 # AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 # IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -41,6 +41,7 @@ import logging
 from ..transformations import __fixed__, FIXED
 from .constrainable import Constrainable
 from .nameable import adjust_name_for_printing
+from ..caching import FunctionCache
 
 class OptimizationHandlable(Constrainable):
     """
@@ -144,16 +145,16 @@ class OptimizationHandlable(Constrainable):
         if self._has_fixes(): return g[self._fixes_]
         return g
 
-    def _transform_gradients_non_natural(self, g):
-        """
-        Transform the gradients by multiplying the gradient factor for each
-        constraint to it.
-        """
-        #py3 fix
-        #[np.put(g, i, c.gradfactor_non_natural(self.param_array[i], g[i])) for c, i in self.constraints.iteritems() if c != __fixed__]
-        [np.put(g, i, c.gradfactor_non_natural(self.param_array[i], g[i])) for c, i in self.constraints.items() if c != __fixed__]
-        if self._has_fixes(): return g[self._fixes_]
-        return g
+    #def _transform_gradients_non_natural(self, g):
+    #    """
+    #    Transform the gradients by multiplying the gradient factor for each
+    #    constraint to it, using the theta transformed natural gradient.
+    #    """
+    #    #py3 fix
+    #    #[np.put(g, i, c.gradfactor_non_natural(self.param_array[i], g[i])) for c, i in self.constraints.iteritems() if c != __fixed__]
+    #    [np.put(g, i, c.gradfactor_non_natural(self.param_array[i], g[i])) for c, i in self.constraints.items() if c != __fixed__]
+    #    if self._has_fixes(): return g[self._fixes_]
+    #    return g
 
 
     @property
@@ -166,30 +167,54 @@ class OptimizationHandlable(Constrainable):
 
     def parameter_names(self, add_self=False, adjust_for_printing=False, recursive=True, intermediate=False):
         """
-        Get the names of all parameters of this model.
+        Get the names of all parameters of this model or parameter. It starts
+        from the parameterized object you are calling this method on.
+
+        Note: This does not unravel multidimensional parameters,
+              use parameter_names_flat to unravel parameters!
 
         :param bool add_self: whether to add the own name in front of names
         :param bool adjust_for_printing: whether to call `adjust_name_for_printing` on names
         :param bool recursive: whether to traverse through hierarchy and append leaf node names
         :param bool intermediate: whether to add intermediate names, that is parameterized objects
         """
-        if adjust_for_printing: adjust = lambda x: adjust_name_for_printing(x)
+        if adjust_for_printing: adjust = adjust_name_for_printing
         else: adjust = lambda x: x
         names = []
-        if intermediate or (not recursive): names.extend([adjust(x.name) for x in self.parameters])
-        if intermediate or recursive: names.extend([xi for x in self.parameters for xi in x.parameter_names(add_self=True, adjust_for_printing=adjust_for_printing)])
+        if intermediate or (not recursive):
+            names.extend([adjust(x.name) for x in self.parameters])
+        if intermediate or recursive: names.extend([
+                xi for x in self.parameters for xi in
+                 x.parameter_names(add_self=True,
+                                   adjust_for_printing=adjust_for_printing,
+                                   recursive=True,
+                                   intermediate=False)])
         if add_self: names = map(lambda x: adjust(self.name) + "." + x, names)
         return names
 
-    def _get_param_names(self):
-        n = np.array([p.hierarchy_name() + '[' + str(i) + ']' for p in self.flattened_parameters for i in p._indices()])
-        return n
+    def parameter_names_flat(self, include_fixed=False):
+        """
+        Return the flattened parameter names for all subsequent parameters
+        of this parameter. We do not include the name for self here!
 
-    def _get_param_names_transformed(self):
-        n = self._get_param_names()
-        if self._has_fixes():
-            return n[self._fixes_]
-        return n
+        If you want the names for fixed parameters as well in this list,
+        set include_fixed to True.
+            if not hasattr(obj, 'cache'):
+                obj.cache = FunctionCacher()
+        :param bool include_fixed: whether to include fixed names here.
+        """
+        name_list = []
+        for p in self.flattened_parameters:
+            name = p.hierarchy_name()
+            if p.size > 1:
+                name_list.extend(["{}[{!s}]".format(name, i) for i in p._indices()])
+            else:
+                name_list.append(name)
+        name_list = np.array(name_list)
+
+        if not include_fixed and self._has_fixes():
+            return name_list[self._fixes_]
+        return name_list
 
     #===========================================================================
     # Randomizeable
@@ -262,6 +287,8 @@ class OptimizationHandlable(Constrainable):
             pi._propagate_param_grad(parray[pislice], garray[pislice])
             pi_old_size += pi.size
 
+        self._model_initialized_ = True
+
     def _connect_parameters(self):
         pass
 
@@ -286,6 +313,21 @@ class Parameterizable(OptimizationHandlable):
         self._added_names_ = set()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.__visited = False # for traversing in reverse order we need to know if we were here already
+        self.cache = FunctionCache()
+
+
+    def initialize_parameter(self):
+        """
+        Call this function to initialize the model, if you built it without initialization.
+
+        This HAS to be called manually before optmizing or it will be causing
+        unexpected behaviour, if not errors!
+        """
+        #logger.debug("connecting parameters")
+        self._highest_parent_._notify_parent_change()
+        self._highest_parent_._connect_fixes()
+        self._highest_parent_._connect_parameters() #logger.debug("calling parameters changed")
+        self.parameters_changed()
 
     @property
     def param_array(self):
@@ -324,13 +366,13 @@ class Parameterizable(OptimizationHandlable):
         See *visitor pattern* in literature. This is implemented in pre-order fashion.
 
         Example::
-            
+
             #Collect all children:
-    
+
             children = []
             self.traverse(children.append)
             print children
-            
+
         """
         if not self.__visited:
             visit(self, *args, **kwargs)
@@ -341,7 +383,7 @@ class Parameterizable(OptimizationHandlable):
     def _traverse(self, visit, *args, **kwargs):
         for c in self.parameters:
             c.traverse(visit, *args, **kwargs)
-        
+
 
     def traverse_parents(self, visit, *args, **kwargs):
         """
@@ -359,6 +401,21 @@ class Parameterizable(OptimizationHandlable):
             self._parent_.traverse_parents(visit, *args, **kwargs)
             self._parent_.traverse(visit, *args, **kwargs)
             self.__visited = False
+
+    #===========================================================================
+    # Caching
+    #===========================================================================
+
+    def enable_caching(self):
+        def visit(self):
+            self.cache.enable_caching()
+        self.traverse(visit)
+
+    def disable_caching(self):
+        def visit(self):
+            self.cache.disable_caching()
+        self.traverse(visit)
+
 
     #=========================================================================
     # Gradient handling
@@ -402,15 +459,14 @@ class Parameterizable(OptimizationHandlable):
         if pname not in dir(self):
             self.__dict__[pname] = param
             self._added_names_.add(pname)
-        elif pname in self.__dict__:
+        else: # pname in self.__dict__
             if pname in self._added_names_:
                 other = self.__dict__[pname]
-                if not (param is other):
-                    del self.__dict__[pname]
-                    self._added_names_.remove(pname)
-                    warn_and_retry(other)
-                    warn_and_retry(param, _name_digit.match(other.name))
-            return
+                #if not (param is other):
+                #    del self.__dict__[pname]
+                #    self._added_names_.remove(pname)
+                #    warn_and_retry(other)
+                #    warn_and_retry(param, _name_digit.match(other.name))
 
     def _remove_parameter_name(self, param=None, pname=None):
         assert param is None or pname is None, "can only delete either param by name, or the name of a param"
@@ -470,9 +526,20 @@ class Parameterizable(OptimizationHandlable):
         """
         pass
 
-    def save(self, filename, ftype='HDF5'):
+    def save(self, filename, ftype='HDF5'): # pragma: no coverage
         """
         Save all the model parameters into a file (HDF5 by default).
+
+        This is not supported yet. We are working on having a consistent,
+        human readable way of saving and loading GPy models. This only
+        saves the parameter array to a hdf5 file. In order
+        to load the model again, use the same script for building the model
+        you used to build this model. Then load the param array from this hdf5
+        file and set the parameters of the created model:
+
+            >>> m[:] = h5_file['param_array']
+
+        This is less then optimal, we are working on a better solution to that.
         """
         from ..param import Param
 
